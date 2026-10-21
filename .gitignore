@@ -1,0 +1,7 @@
+.dropbox-work/
+.env*
+__pycache__/
+*.pyc
+access.json
+*credentials*.json
+*refresh-token*.json
