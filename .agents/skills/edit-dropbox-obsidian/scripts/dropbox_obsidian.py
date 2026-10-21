@@ -23,7 +23,6 @@ import urllib.request
 from datetime import datetime, timezone
 
 MAX_NOTE = 10 * 1024 * 1024
-DEFAULT_TOKEN = Path.home() / '.config/codex-dropbox/access.json'
 
 
 class Failure(Exception):
@@ -46,7 +45,14 @@ def request(url, data, headers=None, upload=False):
         if upload and exc.code == 409:
             raise Failure('Dropbox conflict/deleted note; obtain a new checkout and review; bundle retained') from None
         raise Failure(f'Dropbox HTTP {exc.code}; bundle retained; no automatic retry') from None
-    except (TimeoutError, socket.timeout, urllib.error.URLError, http.client.HTTPException, ConnectionError):
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, OSError) and 'Tunnel connection failed: 403 Forbidden' in str(exc.reason):
+            raise Failure('Cloud proxy denied connection before Dropbox auth; no request reached Dropbox. '
+                          'Enable internet, allow api.dropboxapi.com and content.dropboxapi.com, '
+                          'save/apply and republish the environment, then start a new task') from None
+        detail = 'Upload outcome unknown; compare remote note before any retry' if upload else 'Network request failed'
+        raise Failure(detail) from None
+    except (TimeoutError, socket.timeout, http.client.HTTPException, ConnectionError):
         detail = 'Upload outcome unknown; compare remote note before any retry' if upload else 'Network request failed'
         raise Failure(detail) from None
 
@@ -150,6 +156,14 @@ def private_permissions(path):
 
 
 def token(path):
+    if path is None:
+        result = exchange({'grant_type': 'refresh_token', 'refresh_token': required('DROPBOX_REFRESH_TOKEN'),
+                           'client_id': required('DROPBOX_APP_KEY')})
+        access, lifetime = result.get('access_token'), result.get('expires_in')
+        if (not isinstance(access, str) or not access or not isinstance(lifetime, (int, float))
+                or not math.isfinite(lifetime) or lifetime <= 0):
+            raise Failure('Invalid token response; check Cloud network secret and Dropbox authorization')
+        return access
     try:
         source = regular(Path(path).expanduser())
         private_permissions(source)
@@ -159,10 +173,10 @@ def token(path):
                 or not math.isfinite(value['expires_at'])):
             raise ValueError()
         if value['expires_at'] <= time.time() + 30:
-            raise Failure('Access token expired; remove cache file and rerun setup/prepare or reset environment cache')
+            raise Failure('Explicit access token file expired; replace it securely or use default runtime network secret')
         return value['access_token']
     except (OSError, ValueError, TypeError, KeyError):
-        raise Failure('Invalid access credential file; rerun setup/prepare') from None
+        raise Failure('Invalid explicit access credential file; replace it securely or use default runtime network secret') from None
 
 
 def exchange(fields):
@@ -172,6 +186,11 @@ def exchange(fields):
 
 
 def authorize(args):
+    output = Path(args.out).expanduser()
+    existing_output = ('Authorization output already exists; reuse the saved refresh token in Cloud Secrets, '
+                       'or choose a different new --out if reauthorization is intended')
+    if output.exists() or output.is_symlink():
+        raise Failure(existing_output)
     verifier = secrets.token_urlsafe(64)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
     app_key = required('DROPBOX_APP_KEY')
@@ -184,19 +203,17 @@ def authorize(args):
     refresh = result.get('refresh_token')
     if not isinstance(refresh, str) or not refresh:
         raise Failure('OAuth response missing refresh token')
-    private_json(args.out, {'refresh_token': refresh})
+    try:
+        private_json(args.out, {'refresh_token': refresh})
+    except FileExistsError:
+        raise Failure(existing_output) from None
     print('Refresh token saved to private output file; transfer through Cloud secret settings')
 
 
 def prepare(args):
-    result = exchange({'grant_type': 'refresh_token', 'refresh_token': required('DROPBOX_REFRESH_TOKEN'),
-                       'client_id': required('DROPBOX_APP_KEY')})
-    access, lifetime = result.get('access_token'), result.get('expires_in')
-    if (not isinstance(access, str) or not access or not isinstance(lifetime, (int, float))
-            or not math.isfinite(lifetime) or lifetime <= 0):
-        raise Failure('Invalid token response')
-    private_json(args.credentials, {'access_token': access, 'expires_at': time.time() + lifetime}, replace=True)
-    print('Short-lived credential file created')
+    required('DROPBOX_APP_KEY')
+    root()
+    print('Offline configuration check passed; network/authentication will be checked by task commands')
 
 
 def list_notes(args):
@@ -285,11 +302,11 @@ def apply(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--credentials', default=str(DEFAULT_TOKEN), help='Short-lived token file outside workspace')
+    parser.add_argument('--credentials', help='Explicit short-lived token file; default uses runtime network secret')
     sub = parser.add_subparsers(dest='command', required=True)
     auth = sub.add_parser('authorize', help='Local interactive PKCE setup')
     auth.add_argument('--out', required=True)
-    sub.add_parser('prepare', help='Cloud setup: exchange environment secrets for short-lived access')
+    sub.add_parser('prepare', help='Offline runtime/non-secret configuration check; no authentication or files')
     sub.add_parser('list', help='List existing Markdown paths in vault')
     co = sub.add_parser('checkout')
     co.add_argument('note')

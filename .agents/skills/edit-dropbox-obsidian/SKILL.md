@@ -6,7 +6,8 @@ description: Edit existing UTF-8 Obsidian Markdown notes in a configured Dropbox
 # Dropbox Obsidian の既存ノート編集
 
 対象は `DROPBOX_VAULT_ROOT` 内の既存 `.md` ノートです。\
-実行には Python 3.10 以降と、事前設定済みの短期認証ファイルが必要です。
+実行には Python 3.10 以降と、通常の `DROPBOX_APP_KEY`、`DROPBOX_VAULT_ROOT`、事前設定済みの Network secret `DROPBOX_REFRESH_TOKEN` が必要です。\
+既定では runtime の placeholder を通常の HTTPS 通信で使用して操作ごとに短期 token を取得し、メモリーだけに保持します。
 
 このファイルのあるディレクトリを基準に `scripts/dropbox_obsidian.py` を実行します。\
 設定とユーザーによる同期手順は、導入元リポジトリの README を参照してください。
@@ -27,4 +28,7 @@ description: Edit existing UTF-8 Obsidian Markdown notes in a configured Dropbox
 
 `original.md` と `state.json` は取得時点の基準であり、編集対象に含めません。\
 スクリプトは新規ノート、移動、削除、添付ファイル、暗号化データを扱いません。\
-`authorize` と `prepare` は人間による初期設定用であり、エージェントは長期秘密情報を要求・表示・保存しません。
+`authorize` は人間によるローカルの初期認可用であり、エージェントは長期秘密情報を要求・表示・保存しません。\
+`prepare` は秘密の読み取りや通信を行わない設定チェックです。\
+proxy の CONNECT 403 では再認可せず、両 Dropbox ホストの通信許可と環境の公開・新規タスクへの反映を案内します。\
+継承された proxy と CA 設定を保持してください。

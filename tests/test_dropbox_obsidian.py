@@ -113,15 +113,67 @@ class EditorTests(unittest.TestCase):
         for secret in ('secret-new-refresh', 'secret-code', 'secret-refresh'):
             self.assertNotIn(secret, output.getvalue())
         self.assertIn('code_verifier', call.call_args.args[0])
-        self.args.credentials = str(self.base / 'prepared.json')
-        with patch.object(editor, 'exchange', return_value={'access_token': 'secret-new-access', 'expires_in': 14400}), \
+        with patch.dict(os.environ, {'DROPBOX_REFRESH_TOKEN': ''}), \
+                patch.object(editor, 'request', side_effect=AssertionError('network forbidden')), \
+                patch.object(editor, 'private_json', side_effect=AssertionError('write forbidden')), \
+                patch.object(editor, 'regular', side_effect=AssertionError('credential read forbidden')), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            editor.prepare(self.args)
-        self.assertNotIn('secret', output.getvalue())
-        self.assertEqual(set(json.loads(Path(self.args.credentials).read_text())), {'access_token', 'expires_at'})
-        with patch.object(editor, 'exchange', return_value={'access_token': 'replacement', 'expires_in': 14400}):
-            editor.prepare(self.args)
-        self.assertEqual(json.loads(Path(self.args.credentials).read_text())['access_token'], 'replacement')
+            self.assertEqual(editor.main(['prepare']), 0)
+        self.assertIn('Offline configuration check passed', output.getvalue())
+
+    def test_runtime_secret_form_and_pagination(self):
+        responses = [b'{"access_token":"memory-only-access","expires_in":14400}',
+            b'{"entries":[],"has_more":true,"cursor":"next"}', b'{"entries":[],"has_more":false}']
+        with patch.dict(os.environ, {'DROPBOX_REFRESH_TOKEN': 'proxy-placeholder'}), \
+                patch.object(editor.urllib.request, 'build_opener') as opener, \
+                patch.object(editor, 'private_json', side_effect=AssertionError('write forbidden')), \
+                patch.object(editor, 'regular', side_effect=AssertionError('credential read forbidden')):
+            opener.return_value.open.return_value.__enter__.return_value.read.side_effect = responses
+            self.assertEqual(editor.main(['list']), 0)
+        calls = opener.return_value.open.call_args_list
+        self.assertEqual(len(calls), 3)
+        auth = calls[0].args[0]
+        self.assertEqual(auth.full_url, 'https://api.dropboxapi.com/oauth2/token')
+        self.assertEqual(editor.urllib.parse.parse_qs(auth.data.decode()), {
+            'grant_type': ['refresh_token'], 'refresh_token': ['proxy-placeholder'], 'client_id': ['app']})
+        for call in calls[1:]:
+            self.assertEqual(call.args[0].get_header('Authorization'), 'Bearer memory-only-access')
+
+    def test_runtime_checkout_apply_and_offline_unchanged(self):
+        auth = (b'{"access_token":"memory-only-access","expires_in":14400}', {})
+        with patch.object(editor, 'request', side_effect=[auth, (b'old', {'Dropbox-API-Result': '{"rev":"0123456789"}'})]):
+            self.assertEqual(editor.main(['checkout', self.args.note, '--out', self.args.out]), 0)
+        with patch.object(editor, 'request', side_effect=AssertionError('offline expected')):
+            self.assertEqual(editor.main(['diff', self.args.bundle]), 0)
+            self.assertEqual(editor.main(['apply', self.args.bundle, '--confirm']), 0)
+        (Path(self.args.out) / 'edited.md').write_bytes(b'new')
+        with patch.object(editor, 'request', side_effect=[auth, (b'{"rev":"abcdef0123"}', {})]) as call:
+            self.assertEqual(editor.main(['apply', self.args.bundle, '--confirm']), 0)
+        self.assertEqual(call.call_count, 2)
+        self.assertTrue(call.call_args.kwargs['upload'])
+
+    def test_runtime_missing_or_invalid_auth(self):
+        with patch.dict(os.environ, {'DROPBOX_REFRESH_TOKEN': ''}), patch.object(editor, 'request') as call:
+            with self.assertRaisesRegex(editor.Failure, 'Set DROPBOX_REFRESH_TOKEN'):
+                editor.token(None)
+            call.assert_not_called()
+        with patch.object(editor, 'exchange', return_value={'access_token': '', 'expires_in': 14400}):
+            with self.assertRaisesRegex(editor.Failure, 'Invalid token response'):
+                editor.token(None)
+
+    def test_proxy_connect_denial_is_actionable_and_never_retried(self):
+        for upload in (False, True):
+            error = urllib.error.URLError(OSError('Tunnel connection failed: 403 Forbidden'))
+            with patch.object(editor.urllib.request, 'build_opener') as opener:
+                opener.return_value.open.side_effect = error
+                with self.assertRaisesRegex(editor.Failure, 'Cloud proxy denied connection before Dropbox auth') as failure:
+                    editor.request('https://content.dropboxapi.com/2/files/upload', b'secret-body',
+                                   {'Authorization': 'Bearer secret-header'}, upload=upload)
+                self.assertIn('republish', str(failure.exception))
+                self.assertIn('api.dropboxapi.com and content.dropboxapi.com', str(failure.exception))
+                self.assertNotIn('secret', str(failure.exception))
+                self.assertNotIn('unknown', str(failure.exception))
+                self.assertEqual(opener.return_value.open.call_count, 1)
 
     def test_credential_workspace_boundary(self):
         self.placement.stop()
@@ -132,6 +184,22 @@ class EditorTests(unittest.TestCase):
         with self.assertRaisesRegex(editor.Failure, 'outside'):
             editor.private_json(lexical, {'access_token': 'fake-only'})
         self.assertFalse((repo / '.dropbox-work/must-not-exist.json').exists())
+
+    def test_authorize_existing_output_preserves_token_before_oauth(self):
+        output_path = self.base / 'existing-refresh.json'
+        original = b'{"refresh_token":"fake-existing-secret"}'
+        output_path.write_bytes(original)
+        with patch.object(editor, 'exchange') as exchange, patch.object(editor.getpass, 'getpass') as prompt, \
+                contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            result = editor.main(['authorize', '--out', str(output_path)])
+        self.assertNotEqual(result, 0)
+        self.assertIn('reuse the saved refresh token in Cloud Secrets', errors.getvalue())
+        self.assertIn('new --out', errors.getvalue())
+        self.assertEqual(output.getvalue(), '')
+        self.assertNotIn('fake-existing-secret', errors.getvalue())
+        exchange.assert_not_called()
+        prompt.assert_not_called()
+        self.assertEqual(output_path.read_bytes(), original)
 
     def test_symlink_input_rejected(self):
         with patch.object(editor.Path, 'is_symlink', return_value=True):
